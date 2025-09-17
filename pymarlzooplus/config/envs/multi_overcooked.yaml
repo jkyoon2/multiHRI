@@ -1,0 +1,70 @@
+env: "multi_overcooked"
+
+env_args:
+  layout_name: "3_chefs_smartfactory"  # 기본 레이아웃
+  num_agents: 3                        # 에이전트 수 (3명 이상)
+  encoding_scheme: "OAI_lossless"   # 관찰 인코딩 방식 (OAI_lossless, OAI_feats, OAI_lossless_enhanced)
+  reward_type: "sparse"             # 보상 타입 (sparse, shaped, learner)
+  horizon: 400                      # 에피소드 최대 길이
+  render: False                     # 렌더링 여부
+
+# 테스트 설정
+test_greedy: True
+test_nepisode: 100
+test_interval: 50000
+log_interval: 50000
+runner_log_interval: 10000
+learner_log_interval: 10000
+t_max: 40050000
+
+# Multi Overcooked 특별 설정
+multi_overcooked_config:
+  # 에이전트 역할 설정 (선택사항)
+  agent_roles: ["chef", "server", "coordinator"]  # 3명용 역할
+  
+  # 시작 위치 전략
+  start_position_strategy: "balanced"  # balanced, random, fixed
+  
+  # 보상 설정
+  reward_magnifier: 1.0
+  sparse_ratio: 0.1  # shaped reward 사용시 sparse의 비율
+  dynamic_reward: True
+  final_sparse_r_ratio: 1.0
+  shape_reward: True
+  
+  n_envs: 1
+  overcooked_verbose: False
+
+  # learner 타입별 설정 (reward_type: "learner"일 때)
+  learner_types:
+    agent_0: "collaborator"   # 협력적
+    agent_1: "collaborator"      # 지원형
+    agent_2: "collaborator"     # 기본형
+
+# 알고리즘별 최적화 힌트
+optimization_hints:
+  # QMIX/VDN: 중앙화된 critic을 위한 글로벌 상태 사용
+  centralized_critic: True
+  
+  # MAPPO: 개별 에이전트 관찰 + 글로벌 critic
+  individual_obs: True
+  
+  # MAT: 주의 메커니즘을 위한 에이전트 간 정보 공유
+  attention_sharing: True
+
+# 레이아웃별 추천 설정
+layout_configs:
+  3_chefs_smartfactory:
+    num_agents: 3
+    agent_roles: ["chef", "supplier", "chef"]
+    difficulty: "medium"
+
+# 사용 예시 명령어들:
+# 3명 에이전트로 QMIX 학습:
+# python pymarlzooplus/main.py --config=qmix --env-config=multi_overcooked with env_args.num_agents=3 env_args.layout_name="cramped_room"
+
+# 4명 에이전트로 MAPPO 학습:
+# python pymarlzooplus/main.py --config=mappo --env-config=multi_overcooked with env_args.num_agents=4 env_args.layout_name="coordination_ring"
+
+# Shaped reward로 HAPPO 학습:
+# python pymarlzooplus/main.py --config=happo --env-config=multi_overcooked with env_args.reward_type="shaped" env_args.layout_name="asymmetric_advantages"

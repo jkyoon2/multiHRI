@@ -1,0 +1,44 @@
+name: Tests for HAPPO, MAT-DEC, MASER algo
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - 'main'
+    tags:
+      - 'v*'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    env:
+      PYGLET_HEADLESS: "True"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.8.18'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get install -y python3-opengl
+          pip install -r requirements.txt
+          pip install opencv-python-headless
+          AutoROM -y
+
+      - name: Run tests for HAPPO
+        run: python -m tests.test_training_framework --algo HAPPO
+
+      - name: Run tests for MAT-DEC
+        run: python -m tests.test_training_framework --algo MAT-DEC
+
+      - name: Run tests for MASER
+        run: python -m tests.test_training_framework --algo MASER
+

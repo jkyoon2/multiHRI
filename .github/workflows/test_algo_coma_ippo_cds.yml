@@ -1,0 +1,40 @@
+name: Tests for COMA, IPPO, CDS algo
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - 'main'
+    tags:
+      - 'v*'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.8.18'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get install -y python3-opengl
+          pip install -r requirements.txt
+          pip install opencv-python-headless
+          AutoROM -y
+
+      - name: Run tests for COMA
+        run: python -m tests.test_training_framework --algo COMA
+
+      - name: Run tests for IPPO
+        run: python -m tests.test_training_framework --algo IPPO
+
+      - name: Run tests for CDS
+        run: python -m tests.test_training_framework --algo CDS

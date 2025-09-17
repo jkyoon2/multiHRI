@@ -1,0 +1,43 @@
+name: Tests for EOI, EMC, QPLEX, MADDPG algo
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - 'main'
+    tags:
+      - 'v*'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.8.18'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get install -y python3-opengl
+          pip install -r requirements.txt
+          pip install opencv-python-headless
+          AutoROM -y
+
+      - name: Run tests for EOI
+        run: python -m tests.test_training_framework --algo EOI
+
+      - name: Run tests for EMC
+        run: python -m tests.test_training_framework --algo EMC
+
+      - name: Run tests for QPLEX
+        run: python -m tests.test_training_framework --algo QPLEX
+
+      - name: Run tests for MADDPG
+        run: python -m tests.test_training_framework --algo MADDPG

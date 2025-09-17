@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# OS/IDE
+.DS_Store
+.idea/
+.vscode/
+
+# Artifacts / Large files
+results/
+runs/
+wandb/
+logs/
+*.npz
+*.npy
+*.pt
+*.pth
+*.onnx
+*.pkl
+pymarlzooplus/envs/oai_agents/planning/saved_planners/
