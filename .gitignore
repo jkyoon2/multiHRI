@@ -21,3 +21,12 @@ logs/
 *.onnx
 *.pkl
 pymarlzooplus/envs/oai_agents/planning/saved_planners/
+
+# Large log files
+*.log
+debug_log.txt
+log.txt
+train_*.log
+
+# Jupyter notebooks (optional - uncomment if you don't want to track them)
+# *.ipynb

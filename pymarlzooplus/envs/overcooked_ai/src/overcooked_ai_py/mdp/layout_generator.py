@@ -1,5 +1,6 @@
 import copy
 import random
+from collections import defaultdict, deque
 
 import numpy as np
 
@@ -25,6 +26,20 @@ CODE_TO_TYPE = {
     6: SERVING_LOC,
 }
 TYPE_TO_CODE = {v: k for k, v in CODE_TO_TYPE.items()}
+
+DIRECTION_PRIORITY = ["right", "bottom", "left", "top"]
+OPPOSITE_DIRECTIONS = {
+    "left": "right",
+    "right": "left",
+    "top": "bottom",
+    "bottom": "top",
+}
+DIRECTION_VECTORS = {
+    "left": (-1, 0),
+    "right": (1, 0),
+    "top": (0, -1),
+    "bottom": (0, 1),
+}
 
 
 def mdp_fn_random_choice(mdp_fn_choices):
@@ -157,15 +172,30 @@ class LayoutGenerator(object):
             mdp = OvercookedGridworld.from_layout_name(**mdp_gen_params)
             mdp_generator_fn = lambda: self.padded_mdp(mdp)
         else:
-            required_keys = [
-                "inner_shape",
-                "prop_empty",
-                "prop_feats",
-                "display",
-            ]
-            # with generate_all_orders key start_all_orders will be generated inside make_new_layout method
-            if not mdp_gen_params.get("generate_all_orders"):
-                required_keys.append("start_all_orders")
+            # Check if this is forced coordination mode
+            if mdp_gen_params.get("coordination_mode") == "forced":
+                # For forced coordination, different parameters are required
+                required_keys = [
+                    "n_sets",
+                    "inner_shape",
+                    "prop_empty",
+                    "feature_distribution",
+                    "player_distribution",
+                    "display",
+                ]
+                if not mdp_gen_params.get("generate_all_orders"):
+                    required_keys.append("start_all_orders")
+            else:
+                # Default optional coordination mode
+                required_keys = [
+                    "inner_shape",
+                    "prop_empty",
+                    "prop_feats",
+                    "display",
+                ]
+                if not mdp_gen_params.get("generate_all_orders"):
+                    required_keys.append("start_all_orders")
+            
             missing_keys = [
                 k for k in required_keys if k not in mdp_gen_params.keys()
             ]
@@ -176,11 +206,22 @@ class LayoutGenerator(object):
             ), "These keys were missing from the mdp_params: {}".format(
                 missing_keys
             )
-            inner_shape = mdp_gen_params["inner_shape"]
-            assert (
-                inner_shape[0] <= outer_shape[0]
-                and inner_shape[1] <= outer_shape[1]
-            ), "inner_shape cannot fit into the outershap"
+            # Handle different inner_shape formats
+            if mdp_gen_params.get("coordination_mode") == "forced":
+                # For forced coordination, inner_shape is a list of shapes
+                inner_shapes = mdp_gen_params["inner_shape"]
+                for i, inner_shape in enumerate(inner_shapes):
+                    assert (
+                        inner_shape[0] <= outer_shape[0]
+                        and inner_shape[1] <= outer_shape[1]
+                    ), f"inner_shape[{i}] {inner_shape} cannot fit into the outer_shape {outer_shape}"
+            else:
+                # For optional coordination, inner_shape is a single shape
+                inner_shape = mdp_gen_params["inner_shape"]
+                assert (
+                    inner_shape[0] <= outer_shape[0]
+                    and inner_shape[1] <= outer_shape[1]
+                ), "inner_shape cannot fit into the outershap"
             layout_generator = LayoutGenerator(
                 self.mdp_params_generator, outer_shape=self.outer_shape
             )
@@ -265,14 +306,377 @@ class LayoutGenerator(object):
         return OvercookedGridworld.from_grid(mdp_grid)
 
     def make_new_layout(self, mdp_gen_params):
-        return self.make_disjoint_sets_layout(
-            inner_shape=mdp_gen_params["inner_shape"],
-            prop_empty=mdp_gen_params["prop_empty"],
-            prop_features=mdp_gen_params["prop_feats"],
-            base_param=LayoutGenerator.create_base_params(mdp_gen_params),
-            feature_types=mdp_gen_params["feature_types"],
-            display=mdp_gen_params["display"],
+        # Check if forced coordination mode is requested
+        if mdp_gen_params.get("coordination_mode") == "forced":
+            return self.generate_forced_coordination_layout(mdp_gen_params)
+        else:
+            # Default optional coordination mode
+            return self.make_disjoint_sets_layout(
+                inner_shape=mdp_gen_params["inner_shape"],
+                prop_empty=mdp_gen_params["prop_empty"],
+                prop_features=mdp_gen_params["prop_feats"],
+                base_param=LayoutGenerator.create_base_params(mdp_gen_params),
+                feature_types=mdp_gen_params["feature_types"],
+                display=mdp_gen_params["display"],
+            )
+
+    def generate_forced_coordination_layout(self, mdp_gen_params):
+        """
+        Forced Coordination 모드를 위한 맵을 생성합니다.
+        - 여러 개의 분리된 방(inner_shape 리스트)을 생성
+        - 방 사이에 공유 카운터 공간을 보장하며 배치
+        - feature_distribution에 따라 시설을 전략적으로 배치
+        - player_distribution에 따라 플레이어를 전략적으로 배치
+        """
+        # 1. 파라미터 유효성 검사
+        n_sets = mdp_gen_params['n_sets']
+        assert len(mdp_gen_params['inner_shape']) == n_sets
+        assert len(mdp_gen_params['feature_distribution']) == n_sets
+        assert len(mdp_gen_params['player_distribution']) == n_sets
+
+        # 2. 각 방(Room)을 개별적으로 생성
+        rooms = []
+        for i in range(n_sets):
+            room_shape = mdp_gen_params['inner_shape'][i]
+            # prop_empty는 각 방에 대해 동일하게 적용하거나, 파라미터로 따로 받을 수 있음
+            room_grid = self._create_single_room(room_shape, mdp_gen_params.get("prop_empty", 0.7))
+            rooms.append(room_grid)
+
+        # 3. 전체 맵 그리드에 방들을 '공유 카운터'를 보장하며 배치
+        outer_grid = Grid(self.outer_shape)
+        room_placements = self._place_rooms_with_shared_boundary(
+            outer_grid, rooms, mdp_gen_params.get('shared_counter_prop', 0.1)
         )
+
+        # 4. 'feature_distribution'에 따라 시설 배치
+        self._place_features_strategically(
+            outer_grid, room_placements, mdp_gen_params['feature_distribution']
+        )
+
+        # 5. 'player_distribution'에 따라 플레이어 배치
+        start_positions = self._place_players_strategically(
+            outer_grid, room_placements, mdp_gen_params['player_distribution']
+        )
+        
+        # 6. 최종 MDP 객체 생성 및 반환
+        base_param = LayoutGenerator.create_base_params(mdp_gen_params)
+        mdp_grid = self.padded_grid_to_layout_grid(outer_grid, start_positions, display=mdp_gen_params.get("display", False))
+        return OvercookedGridworld.from_grid(mdp_grid, base_param)
+
+    def _create_single_room(self, shape, prop_empty):
+        """
+        기존의 dig_space_with_disjoint_sets 로직을 재사용해서 단일 방 하나를 생성합니다.
+        이 방 자체는 완전히 연결되어야 합니다 (num_sets=1).
+        """
+        grid = Grid(shape)
+        # 이 방 자체는 완전히 연결되어야 함 (num_sets=1)
+        self.dig_space_with_disjoint_sets(grid, prop_empty) 
+        return grid
+
+    def _place_rooms_with_shared_boundary(self, outer_grid, rooms, shared_counter_prop):
+        """
+        생성된 여러 방을 전체 맵에 배치합니다.
+        방과 방 사이에 벽이 있다는 것을 보장하고, 
+        아이템 교환이 가능한 공유 카운터가 특정 비율 이상이 되도록 보장합니다.
+        """
+        room_placements = {}
+        current_x = 1  # 시작 위치 (벽 고려)
+        
+        for i, room in enumerate(rooms):
+            room_shape = room.shape
+            room_width, room_height = room_shape[0], room_shape[1]
+            
+            # 방을 outer_grid에 배치
+            start_x = current_x
+            start_y = 1  # 상단 벽 고려
+            
+            # 방의 내용을 outer_grid에 복사
+            for x in range(room_width):
+                for y in range(room_height):
+                    outer_x = start_x + x
+                    outer_y = start_y + y
+                    if outer_x < outer_grid.shape[0] - 1 and outer_y < outer_grid.shape[1] - 1:
+                        outer_grid.mtx[outer_x][outer_y] = room.mtx[x][y]
+            
+            # 방 배치 정보 저장
+            room_placements[i] = {
+                'start_pos': (start_x, start_y),
+                'end_pos': (start_x + room_width - 1, start_y + room_height - 1),
+                'shape': room_shape
+            }
+            
+            # 다음 방을 위한 위치 업데이트 (방 + 벽 + 공유 공간)
+            current_x += room_width + 2  # 방 너비 + 벽 2칸
+        
+        # 공유 카운터 보장 로직
+        self._ensure_shared_counters(outer_grid, room_placements, shared_counter_prop)
+        
+        return room_placements
+
+    def _ensure_shared_counters(self, outer_grid, room_placements, shared_counter_prop):
+        """
+        방들 사이에 충분한 공유 카운터가 있는지 확인하고, 부족하면 추가로 생성합니다.
+        """
+        if len(room_placements) < 2:
+            return  # 방이 2개 미만이면 공유 카운터가 필요 없음
+        
+        # 각 방 쌍에 대해 공유 카운터 확인 및 생성
+        for i in range(len(room_placements) - 1):
+            room1_info = room_placements[i]
+            room2_info = room_placements[i + 1]
+            
+            # 두 방 사이의 경계 영역 찾기
+            boundary_area = self._find_boundary_area(room1_info, room2_info)
+            
+            # 필요한 최소 공유 카운터 수 계산
+            room1_area = room1_info['shape'][0] * room1_info['shape'][1]
+            room2_area = room2_info['shape'][0] * room2_info['shape'][1]
+            min_shared_counters = int(np.sqrt(room1_area + room2_area)) - 1
+            
+            # 현재 공유 카운터 수 확인
+            current_shared = self._count_shared_counters(outer_grid, room1_info, room2_info)
+            
+            # 부족하면 추가로 생성
+            if current_shared < min_shared_counters:
+                self._create_additional_shared_counters(outer_grid, room1_info, room2_info, 
+                                                      min_shared_counters - current_shared)
+
+    def _find_boundary_area(self, room1_info, room2_info):
+        """두 방 사이의 경계 영역을 찾습니다."""
+        room1_end_x = room1_info['end_pos'][0]
+        room2_start_x = room2_info['start_pos'][0]
+        
+        # 두 방 사이의 1칸 벽 영역
+        boundary_x = room1_end_x + 1
+        
+        # 두 방의 높이 범위 계산
+        min_y = min(room1_info['start_pos'][1], room2_info['start_pos'][1])
+        max_y = max(room1_info['end_pos'][1], room2_info['end_pos'][1])
+        
+        return {
+            'x': boundary_x,
+            'y_range': (min_y, max_y)
+        }
+
+    def _get_fringe_counters_for_room(self, outer_grid, room_info):
+        """
+        특정 방의 fringe에 해당하는 카운터들을 찾습니다.
+        방 영역 내의 모든 빈공간에 인접한 카운터들의 좌표 집합을 반환합니다.
+        """
+        fringe_counters = set()
+        start_pos = room_info['start_pos']
+        end_pos = room_info['end_pos']
+        start_x, start_y = start_pos
+        end_x, end_y = end_pos
+        
+        # 방 영역 내의 모든 빈공간을 찾음
+        for x in range(start_x, end_x + 1):
+            for y in range(start_y, end_y + 1):
+                location = (x, y)
+                if (outer_grid.is_in_bounds(location) and 
+                    outer_grid.location_is_empty(location)):
+                    
+                    # 이 빈공간에 인접한 모든 카운터들을 fringe에 추가
+                    for neighbor in outer_grid.get_near_locations(location):
+                        if (outer_grid.is_in_bounds(neighbor) and 
+                            outer_grid.terrain_at_loc(neighbor) == TYPE_TO_CODE[COUNTER]):
+                            fringe_counters.add(neighbor)
+        
+        return fringe_counters
+
+    def _count_shared_counters(self, outer_grid, room1_info, room2_info):
+        """두 방 사이의 실제 공유 카운터 수를 계산합니다."""
+        # 각 방의 fringe 카운터 집합을 구함
+        fringe1 = self._get_fringe_counters_for_room(outer_grid, room1_info)
+        fringe2 = self._get_fringe_counters_for_room(outer_grid, room2_info)
+
+        # 두 집합의 교집합(intersection)이 바로 공유 카운터임
+        shared_counters = fringe1.intersection(fringe2)
+
+        return len(shared_counters)
+
+    def _create_additional_shared_counters(self, outer_grid, room1_info, room2_info, needed_count):
+        """
+        추가 공유 카운터를 생성합니다.
+        두 방의 fringe 영역 중 근접한 fringe들을 찾아서 빈 공간으로 만들고,
+        공유 카운터의 개수가 최소 기준을 충족할 때까지 반복합니다.
+        """
+        created = 0
+        max_attempts = 50  # 무한 루프 방지
+        
+        for attempt in range(max_attempts):
+            if created >= needed_count:
+                break
+                
+            # 현재 공유 카운터 수 확인
+            current_shared = self._count_shared_counters(outer_grid, room1_info, room2_info)
+            if current_shared >= needed_count:
+                break
+            
+            # 두 방의 fringe 카운터 집합을 구함
+            fringe1 = self._get_fringe_counters_for_room(outer_grid, room1_info)
+            fringe2 = self._get_fringe_counters_for_room(outer_grid, room2_info)
+            
+            # 공유 가능한 카운터 후보들을 찾음 (한쪽 fringe에만 속한 카운터들)
+            potential_shared = fringe1.symmetric_difference(fringe2)
+            
+            # 공유 카운터로 만들 수 있는 위치를 찾음
+            for counter_pos in potential_shared:
+                if created >= needed_count:
+                    break
+                    
+                # 이 카운터가 두 방 모두에서 접근 가능한지 확인
+                if self._can_become_shared_counter(outer_grid, counter_pos, room1_info, room2_info):
+                    # 카운터를 빈 공간으로 만들어서 공유 공간으로 전환
+                    outer_grid.change_location(counter_pos, EMPTY)
+                    created += 1
+                    
+                    # 공유 카운터 수가 증가했는지 확인
+                    new_shared = self._count_shared_counters(outer_grid, room1_info, room2_info)
+                    if new_shared > current_shared:
+                        break  # 성공적으로 공유 카운터가 생성됨
+
+    def _can_become_shared_counter(self, outer_grid, counter_pos, room1_info, room2_info):
+        """
+        특정 카운터 위치가 두 방 모두에서 접근 가능한 공유 카운터가 될 수 있는지 확인합니다.
+        """
+        # 카운터 주변에 두 방 모두의 빈 공간이 인접해 있는지 확인
+        neighbors = outer_grid.get_near_locations(counter_pos)
+        
+        room1_accessible = False
+        room2_accessible = False
+        
+        for neighbor in neighbors:
+            if not outer_grid.is_in_bounds(neighbor):
+                continue
+                
+            if outer_grid.location_is_empty(neighbor):
+                # 이 빈 공간이 어느 방에 속하는지 확인
+                if self._is_position_in_room(neighbor, room1_info):
+                    room1_accessible = True
+                if self._is_position_in_room(neighbor, room2_info):
+                    room2_accessible = True
+        
+        return room1_accessible and room2_accessible
+
+    def _is_position_in_room(self, position, room_info):
+        """특정 위치가 방 영역 내에 있는지 확인합니다."""
+        x, y = position
+        start_x, start_y = room_info['start_pos']
+        end_x, end_y = room_info['end_pos']
+        
+        return start_x <= x <= end_x and start_y <= y <= end_y
+
+    def _place_features_strategically(self, outer_grid, room_placements, feature_distribution):
+        """
+        feature_distribution 딕셔너리에 따라 각 방의 정해진 위치에 시설을 배치합니다.
+        
+        feature_distribution 예시:
+        {
+            0: [POT, ONION_DISPENSER],  # 방 0에 냄비와 양파 디스펜서
+            1: [DISH_DISPENSER, SERVING_LOC],  # 방 1에 접시 디스펜서와 서빙 위치
+        }
+        """
+        for room_id, features in feature_distribution.items():
+            if room_id not in room_placements:
+                continue
+                
+            room_info = room_placements[room_id]
+            start_pos = room_info['start_pos']
+            end_pos = room_info['end_pos']
+            
+            # 해당 방 영역 내에서 유효한 시설 위치 찾기
+            valid_locations = self._get_valid_feature_locations_in_room(
+                outer_grid, start_pos, end_pos
+            )
+            
+            # 지정된 시설들을 배치
+            for i, feature in enumerate(features):
+                if i < len(valid_locations):
+                    location = valid_locations[i]
+                    outer_grid.add_feature(location, feature)
+
+    def _get_valid_feature_locations_in_room(self, outer_grid, start_pos, end_pos):
+        """특정 방 영역 내에서 시설을 배치할 수 있는 유효한 위치들을 찾습니다."""
+        valid_locations = []
+        start_x, start_y = start_pos
+        end_x, end_y = end_pos
+        
+        for x in range(start_x, end_x + 1):
+            for y in range(start_y, end_y + 1):
+                location = (x, y)
+                if outer_grid.is_valid_feature_location(location):
+                    valid_locations.append(location)
+        
+        # 무작위로 섞어서 다양한 배치 가능
+        np.random.shuffle(valid_locations)
+        return valid_locations
+
+    def _place_players_strategically(self, outer_grid, room_placements, player_distribution):
+        """
+        player_distribution 딕셔너리에 따라 각 방에 플레이어를 배치합니다.
+        
+        player_distribution 예시:
+        {
+            0: [0],  # 방 0에 플레이어 0
+            1: [1],  # 방 1에 플레이어 1
+        }
+        
+        Returns:
+            list: 플레이어들의 시작 위치 리스트
+        """
+        start_positions = [None] * self._get_total_players(player_distribution)
+        
+        for room_id, player_ids in player_distribution.items():
+            if room_id not in room_placements:
+                continue
+                
+            room_info = room_placements[room_id]
+            start_pos = room_info['start_pos']
+            end_pos = room_info['end_pos']
+            
+            # 해당 방 영역 내에서 빈 공간들 찾기
+            empty_locations = self._get_empty_locations_in_room(
+                outer_grid, start_pos, end_pos
+            )
+            
+            # 각 플레이어를 해당 방의 빈 공간에 배치
+            for i, player_id in enumerate(player_ids):
+                if i < len(empty_locations) and player_id < len(start_positions):
+                    location = empty_locations[i]
+                    start_positions[player_id] = location
+        
+        # None이 있는 경우 기본 위치로 채우기
+        for i, pos in enumerate(start_positions):
+            if pos is None:
+                start_positions[i] = outer_grid.get_random_empty_location()
+        
+        return start_positions
+
+    def _get_total_players(self, player_distribution):
+        """총 플레이어 수를 계산합니다."""
+        max_player_id = -1
+        for player_ids in player_distribution.values():
+            if player_ids:
+                max_player_id = max(max_player_id, max(player_ids))
+        return max_player_id + 1 if max_player_id >= 0 else 0
+
+    def _get_empty_locations_in_room(self, outer_grid, start_pos, end_pos):
+        """특정 방 영역 내에서 빈 공간들을 찾습니다."""
+        empty_locations = []
+        start_x, start_y = start_pos
+        end_x, end_y = end_pos
+        
+        for x in range(start_x, end_x + 1):
+            for y in range(start_y, end_y + 1):
+                location = (x, y)
+                if (outer_grid.is_in_bounds(location) and 
+                    outer_grid.location_is_empty(location)):
+                    empty_locations.append(location)
+        
+        # 무작위로 섞어서 다양한 배치 가능
+        np.random.shuffle(empty_locations)
+        return empty_locations
 
     def make_disjoint_sets_layout(
         self,

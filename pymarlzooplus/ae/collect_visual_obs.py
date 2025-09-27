@@ -8,6 +8,7 @@ import pygame
 from pymarlzooplus.envs import REGISTRY as env_REGISTRY
 from .policies.random_policy import RandomPolicy
 from .policies.human_policy import HumanPolicy
+from .policies.rules_policy import RulesPolicy
 
 
 def ensure_dir(path: str):
@@ -21,6 +22,11 @@ def make_policy(policy_name: str, env, seed: int, human_agent_ids: str):
     if policy_name == "human":
         ids = [int(x) for x in human_agent_ids.split(",")] if human_agent_ids else [0]
         return HumanPolicy(n_agents=n_agents, control_agent_ids=ids)
+    if policy_name == "rules":
+        # rules policy needs env to query state; we'll attach it after creation
+        pol = RulesPolicy()
+        pol.env = env  # attach runtime env reference
+        return pol
     raise ValueError(f"Unknown policy: {policy_name}")
 
 
@@ -59,7 +65,16 @@ def rollouts(env_name: str,
                 pygame.time.wait(50)
 
             obs_list = env.get_obs()
-            actions = pol.act(obs_list, info=None)
+            if hasattr(pol, "env"):
+                pol.env = env
+            try:
+                actions = pol.act(obs_list, info=None)
+            except NotImplementedError:
+                # RulesPolicy path: call underlying planner directly
+                from pymarlzooplus.envs.oai_agents.policies.rule_based import RuleBasedPlanner
+                if not hasattr(pol, "planner"):
+                    pol.planner = RuleBasedPlanner()
+                actions = pol.planner.act(env)
             reward, done, info = env.step(actions)
 
             # Collect observations per agent
