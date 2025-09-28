@@ -322,56 +322,273 @@ class LayoutGenerator(object):
 
     def generate_forced_coordination_layout(self, mdp_gen_params):
         """
-        Forced Coordination 모드를 위한 맵을 생성합니다.
-        - 여러 개의 분리된 방(inner_shape 리스트)을 생성
-        - 방 사이에 공유 카운터 공간을 보장하며 배치
-        - feature_distribution에 따라 시설을 전략적으로 배치
-        - player_distribution에 따라 플레이어를 전략적으로 배치
+        그래프 기반 Forced Coordination 모드를 위한 맵을 생성합니다.
+        - room_connectivity 그래프를 기반으로 방들의 연결 구조를 정의
+        - 각 방의 열린 면을 결정하여 공유 카운터 공간을 보장
+        - BFS를 이용해 방들을 물리적으로 배치
+        - 방들 사이에 공유 벽을 건설하여 COUNTER 타일 생성
         """
         # 1. 파라미터 유효성 검사
         n_sets = mdp_gen_params['n_sets']
+        connectivity = mdp_gen_params['room_connectivity']
         assert len(mdp_gen_params['inner_shape']) == n_sets
         assert len(mdp_gen_params['feature_distribution']) == n_sets
         assert len(mdp_gen_params['player_distribution']) == n_sets
+        assert len(connectivity) > 0, "room_connectivity must be provided"
 
-        # 2. 각 방(Room)을 개별적으로 생성
+        # 2. 그래프를 분석하여 각 방의 '열린 면'과 상대적 방향을 결정
+        orientations = self._determine_room_orientations(connectivity)
+        
+        # 3. 결정된 '열린 면'에 따라 각 방을 미리 생성
         rooms = []
         for i in range(n_sets):
-            room_shape = mdp_gen_params['inner_shape'][i]
-            # prop_empty는 각 방에 대해 동일하게 적용하거나, 파라미터로 따로 받을 수 있음
-            room_grid = self._create_single_room(room_shape, mdp_gen_params.get("prop_empty", 0.7))
+            open_sides = set(orientations.get(i, {}).keys())
+            room_grid = self._create_single_room(
+                mdp_gen_params['inner_shape'][i], 
+                mdp_gen_params.get("prop_empty", 0.7), 
+                open_sides
+            )
             rooms.append(room_grid)
 
-        # 3. 전체 맵 그리드에 방들을 '공유 카운터'를 보장하며 배치
-        outer_grid = Grid(self.outer_shape)
-        room_placements = self._place_rooms_with_shared_boundary(
-            outer_grid, rooms, mdp_gen_params.get('shared_counter_prop', 0.1)
-        )
+        # 4. BFS를 이용해 방들을 물리적으로 배치하고 최종 위치 맵을 받음
+        outer_grid = Grid(self.outer_shape, default_terrain=EMPTY)
+        placements = self._place_rooms_with_bfs(outer_grid, rooms, orientations)
+        
+        # 5. 배치된 방들 사이에 '공유 벽'을 건설
+        self._build_shared_walls(outer_grid, placements, connectivity)
 
-        # 4. 'feature_distribution'에 따라 시설 배치
+        # 6. 'feature_distribution'에 따라 시설 배치
         self._place_features_strategically(
-            outer_grid, room_placements, mdp_gen_params['feature_distribution']
+            outer_grid, placements, mdp_gen_params['feature_distribution']
         )
 
-        # 5. 'player_distribution'에 따라 플레이어 배치
+        # 7. 'player_distribution'에 따라 플레이어 배치
         start_positions = self._place_players_strategically(
-            outer_grid, room_placements, mdp_gen_params['player_distribution']
+            outer_grid, placements, mdp_gen_params['player_distribution']
         )
         
-        # 6. 최종 MDP 객체 생성 및 반환
+        # 8. 최종 테두리 벽 추가
+        self._add_outer_walls(outer_grid)
+        
+        # 9. 최종 MDP 객체 생성 및 반환
         base_param = LayoutGenerator.create_base_params(mdp_gen_params)
         mdp_grid = self.padded_grid_to_layout_grid(outer_grid, start_positions, display=mdp_gen_params.get("display", False))
         return OvercookedGridworld.from_grid(mdp_grid, base_param)
 
-    def _create_single_room(self, shape, prop_empty):
+    def _create_single_room(self, shape, prop_empty, open_sides=None):
         """
         기존의 dig_space_with_disjoint_sets 로직을 재사용해서 단일 방 하나를 생성합니다.
         이 방 자체는 완전히 연결되어야 합니다 (num_sets=1).
         """
         grid = Grid(shape)
         # 이 방 자체는 완전히 연결되어야 함 (num_sets=1)
-        self.dig_space_with_disjoint_sets(grid, prop_empty) 
+        self.dig_space_with_disjoint_sets(grid, prop_empty, open_sides) 
         return grid
+
+    def _get_opposite_direction(self, direction):
+        """방향의 반대 방향을 반환"""
+        opposites = {
+            'left': 'right',
+            'right': 'left', 
+            'top': 'bottom',
+            'bottom': 'top'
+        }
+        return opposites.get(direction, direction)
+
+    def _build_adjacency_list(self, connectivity):
+        """연결성 그래프를 인접 리스트로 변환"""
+        # 최대 노드 번호 찾기
+        max_node = max(max(edge) for edge in connectivity) if connectivity else 0
+        adj = [[] for _ in range(max_node + 1)]
+        
+        for u, v in connectivity:
+            adj[u].append(v)
+            adj[v].append(u)
+        return adj
+
+    def _calculate_next_pos(self, current_pos, current_shape, direction):
+        """현재 위치와 모양에서 지정된 방향으로 다음 위치 계산"""
+        x, y = current_pos
+        w, h = current_shape
+        
+        if direction == 'right':
+            return (x + w + 1, y)  # +1 for shared wall space
+        elif direction == 'left':
+            return (x - w - 1, y)  # -1 for shared wall space
+        elif direction == 'bottom':
+            return (x, y + h + 1)  # +1 for shared wall space
+        elif direction == 'top':
+            return (x, y - h - 1)  # -1 for shared wall space
+        else:
+            return current_pos
+
+    def _is_valid_placement(self, outer_grid, pos, shape):
+        """주어진 위치에 해당 shape의 방을 배치할 수 있는지 (경계 및 충돌 검사)"""
+        start_x, start_y = pos
+        width, height = shape
+
+        # 1. 경계 검사
+        if start_x < 1 or start_y < 1 or \
+           start_x + width > outer_grid.shape[0] - 1 or \
+           start_y + height > outer_grid.shape[1] - 1:
+            return False
+
+        # 2. 다른 방과의 충돌 검사
+        for dx in range(width):
+            for dy in range(height):
+                # 해당 위치가 비어있지 않다면 (이미 다른 방의 일부라면) 충돌
+                if not outer_grid.location_is_empty((start_x + dx, start_y + dy)):
+                    return False
+        
+        return True
+
+    def _determine_room_orientations(self, connectivity):
+        """그래프를 분석하여 각 방의 '열린 면'과 상대적 방향을 결정"""
+        orientations = {}  # 결과: {방_idx: {방향: 이웃_idx, ...}}
+        adj = self._build_adjacency_list(connectivity)  # 그래프를 인접 리스트로 변환
+
+        for room_idx in range(len(adj)):
+            orientations[room_idx] = {}
+            # 각 방에 연결된 이웃들을 ['right', 'bottom', 'left', 'top'] 순서로 배치 시도
+            directions = ['right', 'bottom', 'left', 'top']
+
+            for neighbor_idx in adj[room_idx]:
+                # 이웃에게 할당되지 않은 방향을 찾음
+                for direction in directions:
+                    # 양쪽 모두에게 해당 방향이 비어있는지 확인
+                    if direction not in orientations[room_idx] and \
+                       self._get_opposite_direction(direction) not in orientations.get(neighbor_idx, {}):
+
+                        orientations[room_idx][direction] = neighbor_idx
+                        if neighbor_idx not in orientations: 
+                            orientations[neighbor_idx] = {}
+                        orientations[neighbor_idx][self._get_opposite_direction(direction)] = room_idx
+                        break
+        return orientations
+
+    def _place_rooms_with_bfs(self, outer_grid, rooms, orientations):
+        """BFS를 이용해 방들을 물리적으로 배치하고 최종 위치 맵을 받음"""
+        placements = {}  # 결과: {방_idx: {'pos': (x,y), 'grid': room_grid, 'start_pos': (x,y), 'end_pos': (x+w, y+h)}}
+        queue = [0]  # 0번 방부터 시작
+        visited = {0}
+
+        # 첫 번째 방 배치
+        start_pos = (1, 1)
+        placements[0] = {
+            'pos': start_pos, 
+            'grid': rooms[0],
+            'start_pos': start_pos,
+            'end_pos': (start_pos[0] + rooms[0].shape[0], start_pos[1] + rooms[0].shape[1])
+        }
+        self._embed_room_at(outer_grid, rooms[0], start_pos)
+
+        while queue:
+            u_idx = queue.pop(0)
+            u_pos = placements[u_idx]['pos']
+            u_shape = rooms[u_idx].shape
+
+            for direction, v_idx in orientations[u_idx].items():
+                if v_idx not in visited:
+                    # u 옆에 v를 배치할 위치 계산
+                    v_pos = self._calculate_next_pos(u_pos, u_shape, direction)
+                    v_shape = rooms[v_idx].shape
+
+                    # 충돌 및 경계 검사
+                    if self._is_valid_placement(outer_grid, v_pos, v_shape):
+                        self._embed_room_at(outer_grid, rooms[v_idx], v_pos)
+                        placements[v_idx] = {
+                            'pos': v_pos, 
+                            'grid': rooms[v_idx],
+                            'start_pos': v_pos,
+                            'end_pos': (v_pos[0] + v_shape[0], v_pos[1] + v_shape[1])
+                        }
+                        visited.add(v_idx)
+                        queue.append(v_idx)
+        
+        # 모든 방이 배치되었는지 확인
+        if len(placements) != len(rooms):
+            unplaced_rooms = [i for i in range(len(rooms)) if i not in placements]
+            raise RuntimeError(
+                f"Failed to place all rooms. Could not find valid positions for rooms: {unplaced_rooms}. "
+                "Try using a larger outer_shape or a simpler room_connectivity graph."
+            )
+        
+        return placements
+
+    def _embed_room_at(self, outer_grid, room_grid, pos):
+        """방을 외부 그리드의 지정된 위치에 삽입 (빈 공간을 건너뛰고 덮어쓰기)"""
+        x, y = pos
+        for dx in range(room_grid.shape[0]):
+            for dy in range(room_grid.shape[1]):
+                # 방의 모든 타일을 덮어쓰기 (빈 공간이든 아니든)
+                outer_grid.mtx[x + dx][y + dy] = room_grid.mtx[dx][dy]
+
+    def _build_shared_walls(self, outer_grid, placements, connectivity):
+        """최종 배치된 방들 사이의 1칸 빈 공간을 COUNTER로 채움"""
+        
+        for u, v in connectivity:
+            if u in placements and v in placements:
+                u_pos = placements[u]['pos']
+                u_shape = placements[u]['grid'].shape
+                v_pos = placements[v]['pos']
+                v_shape = placements[v]['grid'].shape
+                
+                # 두 방 사이의 1칸짜리 빈 공간의 좌표들을 계산
+                shared_wall_positions = self._calculate_shared_wall_positions(
+                    u_pos, u_shape, v_pos, v_shape
+                )
+                
+                # 해당 타일들을 COUNTER로 변경
+                for pos in shared_wall_positions:
+                    if outer_grid.is_in_bounds(pos) and outer_grid.location_is_empty(pos):
+                        outer_grid.mtx[pos[0]][pos[1]] = TYPE_TO_CODE[COUNTER]
+
+    def _calculate_shared_wall_positions(self, u_pos, u_shape, v_pos, v_shape):
+        """두 방 사이의 공유 벽 위치들을 계산"""
+        u_x, u_y = u_pos
+        u_w, u_h = u_shape
+        v_x, v_y = v_pos
+        v_w, v_h = v_shape
+        
+        shared_positions = []
+        
+        # 수직으로 인접한 경우 (위/아래)
+        if u_x == v_x:  # 같은 x 좌표
+            if u_y + u_h + 1 == v_y:  # u가 v 아래에 있음
+                # u의 위쪽 가장자리와 v의 아래쪽 가장자리 사이
+                for dx in range(min(u_w, v_w)):
+                    shared_positions.append((u_x + dx, u_y + u_h))
+            elif v_y + v_h + 1 == u_y:  # v가 u 아래에 있음
+                # v의 위쪽 가장자리와 u의 아래쪽 가장자리 사이
+                for dx in range(min(u_w, v_w)):
+                    shared_positions.append((v_x + dx, v_y + v_h))
+        
+        # 수평으로 인접한 경우 (좌/우)
+        elif u_y == v_y:  # 같은 y 좌표
+            if u_x + u_w + 1 == v_x:  # u가 v 왼쪽에 있음
+                # u의 오른쪽 가장자리와 v의 왼쪽 가장자리 사이
+                for dy in range(min(u_h, v_h)):
+                    shared_positions.append((u_x + u_w, u_y + dy))
+            elif v_x + v_w + 1 == u_x:  # v가 u 왼쪽에 있음
+                # v의 오른쪽 가장자리와 u의 왼쪽 가장자리 사이
+                for dy in range(min(u_h, v_h)):
+                    shared_positions.append((v_x + v_w, v_y + dy))
+        
+        return shared_positions
+
+    def _add_outer_walls(self, grid):
+        """그리드의 가장자리를 카운터로 채웁니다."""
+        w, h = grid.shape
+        for x in range(w):
+            if grid.location_is_empty((x, 0)): 
+                grid.mtx[x][0] = TYPE_TO_CODE[COUNTER]
+            if grid.location_is_empty((x, h - 1)): 
+                grid.mtx[x][h - 1] = TYPE_TO_CODE[COUNTER]
+        for y in range(h):
+            if grid.location_is_empty((0, y)): 
+                grid.mtx[0][y] = TYPE_TO_CODE[COUNTER]
+            if grid.location_is_empty((w - 1, y)): 
+                grid.mtx[w - 1][y] = TYPE_TO_CODE[COUNTER]
 
     def _place_rooms_with_shared_boundary(self, outer_grid, rooms, shared_counter_prop):
         """
@@ -734,7 +951,7 @@ class LayoutGenerator(object):
         return padded_grid
 
     @staticmethod
-    def dig_space_with_disjoint_sets(grid, prop_empty):
+    def dig_space_with_disjoint_sets(grid, prop_empty, open_sides=None):
         dsets = DisjointSets([])
         while not (
             grid.proportion_empty() > prop_empty and dsets.num_sets == 1
@@ -742,7 +959,7 @@ class LayoutGenerator(object):
             valid_dig_location = False
             while not valid_dig_location:
                 loc = grid.get_random_interior_location()
-                valid_dig_location = grid.is_valid_dig_location(loc)
+                valid_dig_location = grid.is_valid_dig_location(loc, open_sides)
 
             grid.dig(loc)
             dsets.add_singleton(loc)
@@ -805,9 +1022,9 @@ class LayoutGenerator(object):
 
 
 class Grid(object):
-    def __init__(self, shape):
+    def __init__(self, shape, default_terrain=COUNTER):
         assert len(shape) == 2, "Grid must be 2 dimensional"
-        grid = (np.ones(shape) * TYPE_TO_CODE[COUNTER]).astype(int)
+        grid = (np.ones(shape) * TYPE_TO_CODE[default_terrain]).astype(int)
         self.mtx = grid
         self.shape = np.array(shape)
         self.width = shape[0]
@@ -860,21 +1077,31 @@ class Grid(object):
         x, y = location
         return x >= 0 and y >= 0 and x < self.shape[0] and y < self.shape[1]
 
-    def is_valid_dig_location(self, location):
+    def is_valid_dig_location(self, location, open_sides=None):
+        open_sides = open_sides or set()
         x, y = location
 
         # If already empty
         if self.location_is_empty(location):
             return False
 
-        # If one of the edges of the map, or outside the map
-        if (
-            x <= 0
-            or y <= 0
-            or x >= self.shape[0] - 1
-            or y >= self.shape[1] - 1
-        ):
+        # 경계선 확인
+        on_left = x <= 0
+        on_right = x >= self.shape[0] - 1
+        on_top = y <= 0
+        on_bottom = y >= self.shape[1] - 1
+
+        # 열린 면에 해당하면 파내기 허용
+        if ('left' in open_sides and on_left) or \
+           ('right' in open_sides and on_right) or \
+           ('top' in open_sides and on_top) or \
+           ('bottom' in open_sides and on_bottom):
+            return True
+
+        # 열린 면이 아닌 경계선이면 파내기 금지
+        if on_left or on_right or on_top or on_bottom:
             return False
+
         return True
 
     def valid_feature_locations(self):
